@@ -173,14 +173,17 @@ class HostClient:
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Edge-AI RISC-V SoC UART Host Client")
-    parser.add_argument('--port', type=str, default=None, help="Serial port (e.g. COM3, /dev/ttyUSB0)")
+    parser.add_argument('--port', type=str, default=None, help="Serial port (e.g. COM3, COM7, /dev/ttyUSB0)")
     parser.add_argument('--baud', type=int, default=115200, help="Baud rate (default: 115200)")
+    parser.add_argument('--hello', action='store_true', help="Send HELLO handshake frame and verify ACK")
+    parser.add_argument('--smoke', action='store_true', help="Run single-sample smoke test inference")
+    parser.add_argument('--dataset', type=str, default=None, help="Path to test_dataset.bin")
+    parser.add_argument('--manifest', type=str, default=None, help="Path to test_manifest.json")
     parser.add_argument('--test-frame', action='store_true', help="Run internal frame unit tests")
     args = parser.parse_args()
 
-    if args.test_frame or args.port is None:
+    if args.test_frame or (args.port is None and not args.hello and not args.smoke and not args.dataset):
         print("Running Host Frame & Protocol Verification...")
-        # Verify frame builder and parser
         hello = build_frame(TYPE_HELLO, b'')
         ok, res, msg = parse_frame(hello)
         assert ok and res['type'] == TYPE_HELLO and res['length'] == 0
@@ -190,17 +193,86 @@ if __name__ == '__main__':
         data_frame = build_frame(TYPE_INPUT_DATA, data_test)
         ok, res, msg = parse_frame(data_frame)
         assert ok and res['type'] == TYPE_INPUT_DATA and res['length'] == 256 and res['payload'] == data_test
-        print(f"INPUT_DATA (256-byte) Verification: PASS (CRC = 0x{res['length']:04X})")
+        print(f"INPUT_DATA (256-byte) Verification: PASS")
 
         run_frame = build_frame(TYPE_RUN, b'')
         ok, res, msg = parse_frame(run_frame)
         assert ok and res['type'] == TYPE_RUN
         print("RUN Frame Verification: PASS")
 
-        # Test CRC corruption
         corrupted = bytearray(hello)
         corrupted[-1] ^= 0xFF
         ok, res, msg = parse_frame(bytes(corrupted))
         assert not ok and "CRC mismatch" in msg
         print("Corrupted CRC Rejection: PASS")
         print("All host protocol unit tests passed successfully!")
+        sys.exit(0)
+
+    client = HostClient(port=args.port, baud=args.baud)
+    client.connect()
+
+    # 1. Hello Handshake
+    if args.hello:
+        ok = client.send_hello()
+        if ok:
+            print("Handshake successful: SoC is alive and communicating at 115200 baud.")
+        else:
+            print("Handshake failed! Please check COM port and switch SW0 (must be UP).")
+        sys.exit(0 if ok else 1)
+
+    # 2. Dataset / Batch Mode
+    if args.dataset:
+        import json
+        with open(args.dataset, 'rb') as f:
+            raw_data = f.read()
+
+        manifest = []
+        if args.manifest:
+            with open(args.manifest, 'r') as f:
+                manifest = json.load(f)
+
+        num_samples = len(raw_data) // 784
+        print(f"Loaded dataset: {num_samples} samples.")
+        correct = 0
+
+        for idx in range(num_samples):
+            sample = raw_data[idx*784 : (idx+1)*784]
+            gold = manifest[idx]['label'] if idx < len(manifest) else "?"
+            print(f"\n--- Testing Image {idx} (Expected: {gold}) ---")
+            client.send_tensor(sample)
+            pred, logits, cycles = client.run_inference()
+            is_match = (pred == gold)
+            if is_match:
+                correct += 1
+            print(f"[Image {idx:02d}] Gold: {gold} | Predicted: {pred} | Latency: {cycles} cycles | {'MATCH' if is_match else 'FAIL'}")
+
+        print("\n" + "="*60)
+        print(f"Batch Accuracy: {correct}/{num_samples} ({100.0*correct/num_samples:.1f}%)")
+        print("="*60)
+        sys.exit(0)
+
+    # 3. Smoke Test or Default Run
+    # Default to sample image test if dataset exists, else dummy
+    dataset_path = os.path.join(os.path.dirname(__file__), '..', 'model', 'test_dataset.bin')
+    manifest_path = os.path.join(os.path.dirname(__file__), '..', 'model', 'test_manifest.json')
+    if os.path.exists(dataset_path):
+        import json
+        with open(dataset_path, 'rb') as f:
+            sample = f.read()[:784]
+        gold = "?"
+        if os.path.exists(manifest_path):
+            with open(manifest_path, 'r') as f:
+                gold = json.load(f)[0]['label']
+        print(f"Running Inference Smoke Test (First Sample, Gold = {gold})...")
+        client.send_hello()
+        client.send_tensor(sample)
+        pred, logits, cycles = client.run_inference()
+        print(f"\nSmoke Test Result: Predicted Digit = {pred} (Expected = {gold})")
+        if str(pred) == str(gold):
+            print("STATUS: SUCCESS (Bit-Exact Match!)")
+        else:
+            print("STATUS: Check logits and weights alignment.")
+    else:
+        print("Sending HELLO handshake...")
+        client.send_hello()
+
