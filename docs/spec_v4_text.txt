@@ -1,0 +1,719 @@
+=== PAGE 1 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+RISC-V SoC + 8×8 Weight-Stationary 
+Accelerator
+IMPLEMENTATION SPECIFICATION — VERSION 4.0
+Code-generation baseline for an AI/RTL implementation agent
+Item Frozen value
+Target board Digilent ZedBoard
+FPGA AMD/Xilinx Zynq-7000 XC7Z020 (Zynq-7020)
+CPU IP PicoRV32 (`picorv32` native-memory-interface core)
+CPU source https://github.com/YosysHQ/picorv32.git
+Accelerator IP User-supplied fixed 8×8 weight-stationary systolic accelerator
+Accelerator top `accelerator` (DW=8, AW=32)
+Array 8×8 = 64 PEs
+Arithmetic signed INT8 × signed INT8  signed INT32→
+Clock 100 MHz PL clock target
+Memory BRAM-first; 32 KiB instruction + 224 KiB data
+Interconnect PicoRV32 native valid/ready; no AXI in MVP
+Host link External PL UART, 115200 8N1
+PS/DDR Excluded from MVP
+Implementation note: This document supersedes the prior v3.0 specification. It deliberately removes contradictory 
+alternatives and freezes one implementation path. It does not authorize modification of the supplied accelerator RTL 
+or the PicoRV32 source.
+=== PAGE 2 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+1. Instructions to the RTL / AI Coding Agent
+Treat this document as the single normative implementation baseline. Generate the new integration RTL, 
+memory/MMIO logic, DMA, UART, firmware build files, and simulation environment only within the boundaries 
+below.
+ Use the official `picorv32` module from the YosysHQ repository. Use the native memory interface of 
+`picorv32`; do not use `picorv32_axi`, `picorv32_wb`, or an AXI bridge in the MVP.
+ Instantiate the user-supplied accelerator as fixed IP. Do not edit its internal RTL, rename its ports, or 
+redesign its PE/systolic dataflow.
+ Do not enable the Zynq Processing System, PS DDR, HP ports, AXI interconnect, Linux, cache, camera input, 
+second accelerator, or generic scatter-gather DMA in the MVP.
+ Implement only the wrapper, interconnect, memories, DMA, UART, reset logic, system registers, and 
+firmware support described here.
+ All unspecified behavior is an implementation choice only when it does not change a normative rule. Do not 
+invent alternative protocols, addresses, or ownership rules.
+ Provide compile order, synthesis constraints, simulation files, and a short README that reproduces the same 
+build.
+ Do not claim accelerator correctness until the standalone fixed-IP regression and the integrated known-
+matrix regression both pass.
+1.1 Required source artifacts
+Artifact Use
+PicoRV32 repository Official CPU IP; pin the commit hash in the build manifest
+User accelerator RTL archive Fixed accelerator IP; source files listed in Section 3
+This v4.0 specification Single implementation contract
+Reference CNN weights External binary/mem file; must not be invented by the RTL 
+agent
+2. Frozen MVP Architecture
+The MVP is a programmable-logic-only SoC. PicoRV32 is the only CPU. The Zynq PS is present physically on the 
+ZedBoard but is not used by this design.
+ZedBoard / Zynq-7020 (PL only)
+100 MHz
+  |
+  +--> PicoRV32 (RV32IM, native bus)
+          |
+          +--> Native Interconnect --> IMEM BRAM
+          |                      \\--> DMEM BRAM
+          |                       \\-> SYS / ACC / DMA / UART
+          |
+          +--> DMA (CPU-driven) --> ACC Wrapper --> Existing 8x8 WS Accelerator
+Host PC -- external 3.3 V UART --> PL UART
+Included in MVP Excluded from MVP
+PicoRV32 native core Zynq PS / ARM CPU
+BRAM instruction/data memory PS DDR3
+Native interconnect AXI interconnect
+=== PAGE 3 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+CPU-driven DMA Generic AXI DMA
+Accelerator wrapper Accelerator internal redesign
+Existing 8×8 WS accelerator Second accelerator instance
+Polled PL UART Linux / camera / network
+3. Fixed Accelerator IP Contract
+The accelerator IP is supplied by the user and is treated as a black-box integration target. The characterization 
+below is extracted from the supplied RTL structure. Functional correctness remains a mandatory regression 
+gate.
+Characteristic Frozen contract
+Top module `accelerator`
+Parameters DW=8, AW=32
+Clock/reset `clk`; synchronous active-low `rst_n`
+Start `start` input; accepted only by controller IDLE
+Status `busy` and `done` outputs
+Operand write `wr_en`, `matrix_select`, `wr_row[2:0]`, `wr_col[2:0]`, signed 
+`wr_data[7:0]`
+Matrix select 0 = Activation A; 1 = Weight B
+Matrix size 8×8 activation + 8×8 weight
+PE count 64
+Arithmetic signed INT8 operands; signed INT32 partial sum/result
+Result read `rd_en`, `rd_addr[5:0]`, signed `rd_data[31:0]`, `rd_valid`
+Result addressing `rd_addr = 8*row + column`, 0..63
+Result access Random-address read is supported by the supplied output buffer; 
+integration software may read row-major
+Internal reset effect Clears accelerator state and internal operand/result buffers
+Abort No native abort input; wrapper may assert local accelerator reset
+Native hardware error None; wrapper owns integration/protocol error reporting
+3.1 Accelerator source file set
+File Module / role
+accelerator_top.v module `accelerator` — fixed IP top
+controller.v accelerator control FSM
+data_path.v buffer/skew/systolic/output datapath
+activation_buffer.v 8×8 activation storage
+weight_buffer.v 8×8 weight storage
+skew.v activation skew pipeline
+systolic_8x8.v 64-PE systolic array
+pe.v weight-stationary MAC PE
+output_buffer.v 8×8 INT32 result storage/readout
+Implementation note: Source-review risk to validate before system sign-off: `mac_en` remains asserted in the 
+controller WAIT_OUTPUT/CAPTURE states, while the PE does not qualify the MAC with skew-valid. This is not a 
+permission to change the IP. It is a required standalone regression item; integration must use the exact IP and fail sign-
+off if its matrix results are not bit-exact.
+3.2 Fixed-IP timing contract
+Accepted START
+  -> 64 weight-read cycles
+  -> 64 weight-load cycles
+  -> 1 clear cycle
+  -> 8 activation-read/compute cycles
+=== PAGE 4 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+  -> 1 wait cycle
+  -> 15 capture cycles
+  -> 1 DONE state/pulse
+  = 154 controller cycles total
+Do not use 154 as the system end-to-end latency.
+Measure load + compute + result-drain separately.
+Implementation note: The specification uses 154 cycles as the source-derived fixed-controller schedule. The 
+integrated testbench must measure and confirm the edge-to-edge definition used by the implementation.
+4. PicoRV32 CPU Configuration
+Use the `picorv32` native-memory-interface core from the official YosysHQ repository. The official repository 
+provides both a native interface and an AXI4-Lite variant; this specification selects only the native `picorv32` 
+core. 
+Parameter MVP setting
+Core `picorv32`
+ENABLE_REGS_16_31 1
+ENABLE_REGS_DUALPORT 1
+ENABLE_COUNTERS 1
+ENABLE_COUNTERS64 1
+TWO_STAGE_SHIFT 1
+BARREL_SHIFTER 0
+COMPRESSED_ISA 0
+ENABLE_MUL 0
+ENABLE_FAST_MUL 1
+ENABLE_DIV 1
+ENABLE_IRQ 0
+CATCH_MISALIGN 1
+CATCH_ILLINSN 1
+PROGADDR_RESET 0x0000_0000
+STACKADDR 0x0000_FFF0
+Clock 100 MHz target
+The native CPU interface is the official five-field request/response contract plus instruction qualifier:
+CPU -> SoC:
+  mem_valid   1
+  mem_instr   1
+  mem_addr   32
+  mem_wdata   32
+  mem_wstrb    4
+SoC -> CPU:
+  mem_ready   1
+  mem_rdata  32
+ A CPU request remains active until `mem_ready` is asserted.
+ Word accesses are 32-bit aligned (`addr[1:0] == 0`).
+ CPU read: `mem_wstrb = 4'b0000`.
+ CPU full-word write: `mem_wstrb = 4'b1111`.
+ Data-memory byte/halfword stores are allowed using byte strobes.
+ MMIO byte/halfword accesses are unsupported: complete with an error and no side effect.
+=== PAGE 5 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+ Invalid accesses complete; reads return zero; writes are suppressed; `SYS_STATUS.BUS_ERROR` is latched.
+ The implementation may use one or two cycles for registered read return, but must never stall indefinitely.
+4.1 Firmware toolchain contract
+Compiler ISA:        -march=rv32im
+ABI:                 -mabi=ilp32
+Optimization:        -Os
+Code model:          flat local memory; no Linux / libc dependency
+Reset vector:        0x00000000
+Stack top:           0x0000FFF0
+Implementation note: The linker script must place `.text` in IMEM and all `.data`, `.bss`, heap, and stack inside the 
+defined DMEM. The code-generation agent must not use addresses above the DMEM limit for the CPU stack.
+5. Memory Map
+Region Start End Size Purpose
+Instruction BRAM 0x0000_0000 0x0000_7FFF 32 KiB PicoRV32 program
+DMEM scratch 0x0000_8000 0x0000_FFFF 32 KiB stack, `.data`, scratch
+INPUT 0x0001_0000 0x0001_3FFF 16 KiB preprocessed INT8 input / 
+staged A tiles
+WEIGHTS 0x0001_4000 0x0002_BFFF 96 KiB quantized weights + int32 
+bias metadata
+FEATURE_A 0x0002_C000 0x0003_3FFF 32 KiB INT8 feature buffer A
+FEATURE_B 0x0003_4000 0x0003_BFFF 32 KiB INT8 feature buffer B
+OUTPUT 0x0003_C000 0x0003_FFFF 16 KiB INT32 result / software 
+accumulation scratch
+SYS MMIO 0x4000_0000 0x4000_00FF 256 B system status/reset/counter
+ACC MMIO 0x4000_0100 0x4000_01FF 256 B accelerator control/status
+DMA MMIO 0x4000_0200 0x4000_02FF 256 B DMA control/status
+UART MMIO 0x4000_0300 0x4000_03FF 256 B UART data/status
+All other elsewhere elsewhere — invalid; complete with 
+error
+Implementation note: This is the single authoritative address map. No other MMIO base addresses are permitted in 
+generated RTL, firmware, linker scripts, or tests.
+5.1 Memory ownership
+Region CPU DMA Rule
+IMEM R — Initialized at bitstream 
+build/update time
+DMEM R/W R/W Dual-port; same-address dual 
+write is prohibited
+INPUT R/W R/W CPU stages image/tile; DMA 
+loads accelerator
+WEIGHTS R R Runtime writes not required; 
+weights may be preloaded
+FEATURE_A/B R/W R/W Software-managed ping/pong 
+buffers
+OUTPUT R/W W
+DMA stores INT32 accelerator 
+results; CPU may read or use 
+as scratch
+=== PAGE 6 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+6. Native Interconnect
+                    PicoRV32 CPU master
+                           │
+                    ┌──────▼──────┐
+                     Address     │ │
+                     decoder     │ │
+                    └───┬──┬──┬───┘
+                            │ │ │
+                      ┌─────┘ │ └───────┐
+                                    ▼ ▼ ▼
+                IMEM     DMEM       MMIO
+                                     │
+                              ┌──────┼──────┐
+                                          ▼ ▼ ▼
+                             SYS    ACC    DMA/UART
+Access class Completion
+IMEM read 1–2 cycles; `mem_ready` only when `mem_rdata` is valid
+DMEM read 1–2 cycles; BRAM registered read
+DMEM write complete after write acceptance
+MMIO read registered read; no side effect before acceptance
+MMIO write write side effect occurs only on accepted transaction
+Invalid address complete with error; read data = 0
+7. SYS MMIO
+Offset Register Access Definition
+0x00 SYS_ID RO Constant build ID/revision
+0x04 SYS_STATUS RO READY, BUS_ERROR, CPU_TRAP, 
+ACC_FAULT, DMA_ERROR
+0x08 SYS_CONTROL RW/W1P
+SOFT_RESET, 
+CLEAR_BUS_ERROR, 
+CLEAR_CPU_TRAP, 
+CLEAR_ACC_FAULT, 
+CLEAR_DMA_ERROR
+0x0C SYS_CYCLE_COUNTER RO Free-running 32-bit system clock 
+counter
+SYS_STATUS bits
+  bit 0 READY        : hardware/system operational
+  bit 1 BUS_ERROR    : sticky invalid/misused bus access
+  bit 2 CPU_TRAP     : sticky PicoRV32 trap
+  bit 3 ACC_FAULT    : sticky wrapper/accelerator fault
+  bit 4 DMA_ERROR    : sticky DMA fault
+Implementation note: A CPU trap may halt the CPU. Hardware shall latch the trap in `SYS_STATUS.CPU_TRAP`; 
+firmware is not required to recover from a halted CPU. External reset remains the ultimate recovery mechanism.
+8. Accelerator Wrapper
+The wrapper is the only legal integration boundary around the fixed accelerator. It converts CPU MMIO and 
+DMA element operations into the fixed IP port signals.
+=== PAGE 7 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+8.1 Wrapper state machine
+IDLE
+   CPU full-word ACC_WRITE_DATA -> load one selected element├─
+   CPU START -> RUN├─
+   illegal access -> reject, latch error└─
+RUN
+   fixed IP busy monitored├─
+   no element writes├─
+   no result reads├─
+   fixed IP done -> DONE_LATCHED / OUTPUT└─
+OUTPUT
+   result reads allowed├─
+   DMA result drain allowed when DMA owns port├─
+   new START only after result phase is complete / wrapper re-enters IDLE└─
+FAULT
+   block accelerator data path├─
+   LOCAL_RESET -> IDLE after reset release└─
+8.2 ACC register map
+Offset Register Access Semantics
+0x00 ACC_CONTROL RW/W1P
+bit0 START; bit1 CLEAR_DONE; 
+bit2 LOCAL_RESET; bit3 
+CLEAR_ERROR
+0x04 ACC_STATUS RO
+bit0 BUSY; bit1 DONE_LATCHED; 
+bit2 RESULT_VALID; bit3 ERROR; 
+bits[15:8] error code
+0x08 ACC_MATRIX_SELECT RW 0 activation; 1 weight
+0x0C ACC_ROW RW 3-bit row 0..7
+0x10 ACC_COLUMN RW 3-bit column 0..7
+0x14 ACC_WRITE_DATA WO Full-word store is the sole CPU 
+element-write trigger
+0x18 ACC_READ_ADDRESS RW 6-bit result index row*8+col
+0x1C ACC_READ_COMMAND W1P Issue one fixed-IP result read
+0x20 ACC_READ_DATA RO Latched signed INT32 read result
+0x24 ACC_CYCLES RO Cycles from accepted START 
+counter origin until DONE
+0x28 ACC_ERROR RO Latched wrapper error code
+8.3 CPU element write semantics
+1. CPU owns accelerator port (DMA_OWNER=0).
+2. ACC_MATRIX_SELECT, ACC_ROW, ACC_COLUMN are programmed.
+3. CPU performs one aligned full-word store to ACC_WRITE_DATA.
+4. If wrapper is not RUNNING/FAULT and ownership is legal:
+      -> fixed-IP wr_en pulses for exactly one clock
+      -> matrix_select/row/col/data are held for that event
+5. Partial MMIO strobes are rejected and must not modify accelerator state.
+6. A write while fixed IP is busy is rejected; it is never stalled.
+8.4 START/DONE semantics
+ The wrapper generates exactly one-cycle `start` pulse to the fixed IP.
+ START is accepted only when the fixed IP is idle, wrapper state is IDLE, and DMA_OWNER=0.
+ START while busy is rejected and does not restart or extend the fixed-IP run.
+=== PAGE 8 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+ The fixed IP `done` pulse is latched into `DONE_LATCHED` so firmware polling cannot miss it.
+ The fixed IP `busy` output is exposed as the live `BUSY` status.
+ The wrapper never generates a START automatically after a DMA completion.
+9. DMA Engine
+The DMA is a small CPU-programmed transfer engine, not a generic DMA framework. It performs exactly the 
+data movement required by the fixed accelerator interface.
+Mode Value Source Destination Length
+ACT_LOAD 0 Data memory Accelerator activation 
+buffer 64 bytes
+WEIGHT_LOAD 1 WEIGHTS/data memory Accelerator weight 
+buffer 64 bytes
+RESULT_STORE 2 Accelerator output Data memory / OUTPUT 256 bytes
+9.1 DMA registers
+Offset Register Access Definition
+0x00 DMA_CONTROL RW/W1P
+bit0 START; bit1 ABORT; bit2 
+CLEAR_DONE; bit3 CLEAR_ERROR; 
+bits[5:4] MODE
+0x04 DMA_STATUS RO
+bit0 BUSY; bit1 DONE; bit2 ERROR; 
+bits[15:8] error code; bits[31:16] 
+bytes completed
+0x08 DMA_SRC_ADDR RW 32-bit aligned data-memory source 
+for load modes
+0x0C DMA_DST_ADDR RW 32-bit aligned data-memory 
+destination for RESULT_STORE
+0x10 DMA_LENGTH RW Legal values: 64 for loads; 256 for 
+result store
+0x14 DMA_OWNER RW 0=CPU owns accelerator data path; 
+1=DMA owns
+0x18 DMA_TIMEOUT RW 32-bit whole-command timeout; 
+reset default 1,000,000
+0x1C DMA_ERROR_CODE RO 8-bit latched error code
+9.2 DMA transfer rules
+ DMA is started only by CPU firmware.
+ DMA_OWNER must be set to 1 before a DMA transfer; changing ownership while DMA is BUSY is rejected.
+ No DMA completion may directly or indirectly assert accelerator START.
+ For ACT_LOAD/WEIGHT_LOAD, each 32-bit memory read is split little-endian into four INT8 element writes.
+ For RESULT_STORE, DMA reads accelerator result index 0..63 in row-major order, waits for each one-cycle 
+read response, then writes one 32-bit result to memory.
+ The fixed accelerator remains element-oriented; packing is a DMA-only implementation function.
+ DMA shall use one outstanding memory read at a time.
+ DMA never accesses MMIO.
+ DMA validates source/destination/length before the first transfer beat.
+9.3 DMA result address
+For result element (row, col):
+  result_index = 8*row + col
+  destination_address = DMA_DST_ADDR + 4*result_index
+=== PAGE 9 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+For a contiguous 8x8 INT32 result:
+  row stride = 32 bytes
+9.4 DMA error codes
+Code Meaning Action
+0x10 Timeout Abort boundedly; latch bytes completed
+0x11 Illegal source address Reject before bus activity
+0x12 Illegal destination address Reject before bus activity
+0x13 Illegal length/mode Reject before bus activity
+0x14 Ownership violation Reject; CPU must acquire ownership
+0x15 Memory/bus error Abort; surface in SYS_STATUS
+10. PL UART
+Parameter MVP setting
+Physical link External 3.3 V USB-UART adapter to PL pins
+Baud 115200
+Format 8 data, no parity, 1 stop
+FIFO depth 16 bytes RX + 16 bytes TX
+Clock 100 MHz system clock
+Oversampling tick 16×
+Divisor 53 (0x35)
+CDC 2-FF synchronizer on RX input
+10.1 UART registers
+Offset Register Access Definition
+0x00 UART_DATA RW Low 8 bits are TX write / RX 
+read data
+0x04 UART_STATUS RO bit0 RX_VALID; bit1 
+TX_READY; bit2 RX_OVERRUN
+0x08 UART_DIVISOR RW Program 53 for 115200 baud 
+at 100 MHz
+0x0C UART_CONTROL RW/W1P bit0 RX_FLUSH; bit1 
+TX_FLUSH
+10.2 Host framing used by firmware
+FRAME
+  0xA5 0x5A
+  TYPE        : 1 byte
+  LENGTH      : 2 bytes, little-endian
+  PAYLOAD     : 0..256 bytes
+  CRC16       : 2 bytes, little-endian
+CRC16-CCITT:
+  polynomial = 0x1021
+  init       = 0xFFFF
+  coverage   = TYPE || LENGTH || PAYLOAD
+Firmware frame types:
+=== PAGE 10 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+  0x01 HELLO
+  0x02 INPUT_DATA
+  0x03 RUN
+  0x04 RESULT
+  0x7E NACK
+  0x7F ACK
+Implementation note: The UART hardware is only a byte transport. Frame parsing, CRC, ACK/NACK, and image 
+protocol are firmware responsibilities.
+11. Clock, Reset, and CDC
+ One 100 MHz PL clock is used for PicoRV32, interconnect, BRAM control, DMA, wrapper, accelerator, and 
+UART logic.
+ No generated or divided clocks are used. UART timing is produced by a counter/divider in the 100 MHz 
+domain.
+ External reset is active-low. Internal block resets are synchronous to the 100 MHz clock.
+ The wrapper shall be able to assert a local accelerator reset for at least four full cycles.
+ Local accelerator reset must not corrupt CPU or DMA state unless the software explicitly requests a system 
+reset.
+ UART RX enters a two-flip-flop synchronizer before functional use; the raw asynchronous pin must not fan 
+out elsewhere.
+ Exact ZedBoard reset/UART pin numbers shall come from the final XDC and shall not be guessed by the 
+coding agent.
+11.1 Timing closure
+Clock constraint:
+  create_clock -period 10.000 [get_ports clk_100m]
+Required post-route:
+  WNS >= 0
+  TNS >= 0
+  WHS >= 0
+  Unconstrained paths = 0
+No false-path exception may hide the UART RX synchronizer.
+12. Edge-AI Workload Contract
+The SoC is optimized for one static quantized CNN. A tiny MNIST-style CNN is the reference workload because it 
+fits comfortably in BRAM and exercises convolution, pooling, fully-connected layers, K-split, requantization, and 
+argmax.
+Layer Shape / operation Weight size
+Input 28×28×1 INT8 —
+Conv1 3×3×1  8, stride 1, no padding; output 26×26×8→ 72 B + 32 B bias
+ReLU1 INT8 elementwise —
+Pool1 2×2 max pool, stride 2; output 13×13×8 —
+Conv2 3×3×8  16, stride 1, no padding; output →
+11×11×16 1152 B + 64 B bias
+ReLU2 INT8 elementwise —
+Pool2 2×2 max pool, stride 2; output 5×5×16 —
+FC1 400  32→ 12800 B + 128 B bias
+=== PAGE 11 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+ReLU3 INT8 elementwise —
+FC2 32  10→ 320 B + 40 B bias
+Output 10 INT32 logits  argmax→ —
+Total reference model weights + 32-bit biases are approximately 14.3 KiB, well below the 96 KiB weight region. A 
+different model may be substituted only if it passes the memory/quantization checks below.
+12.1 GEMM lowering
+All Conv/FC layers are lowered to:
+  C[M,N] = A[M,K] × B[K,N]
+Tile contract:
+  A tile = 8×8 INT8
+  B tile = 8×8 INT8
+  C tile = 8×8 INT32
+For M, N, or K not divisible by 8:
+  - software zero-pads the final tile;
+  - accelerator still receives exactly 8×8 operands;
+  - only valid output rows/columns are consumed.
+For K > 8:
+  - issue ceil(K/8) accelerator STARTs;
+  - each START computes one 8-term partial;
+  - accumulate partials in INT32 in software.
+12.2 Quantization
+Parameter MVP rule
+Operand type signed INT8, -128..127
+Zero point 0
+Quantization symmetric
+Scale per-tensor; power-of-two preferred
+Accumulator signed INT32
+Requantization software after INT32 accumulation
+Rounding nearest, ties away from zero
+Saturation clip to [-128, 127]
+Argmax tie lowest class index wins
+Overflow model converter must prove selected INT32 paths do not 
+overflow
+For a nonnegative integer shift s:
+  q_pos = (x + 2^(s-1)) >>> s
+For a negative x:
+  q_neg = -(((-x) + 2^(s-1)) >>> s)
+Then:
+  q = clamp(q, -128, 127)
+For shift = 0:
+  q = x
+=== PAGE 12 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+13. Firmware Control Flow
+BOOT
+  -> initialize stack/data
+  -> configure UART_DIVISOR = 53
+  -> clear system/ACC/DMA sticky status
+  -> confirm required memory regions
+  -> wait for host command
+INPUT LOAD
+  -> receive framed INT8 image
+  -> validate length / CRC
+  -> store 28x28 tensor in INPUT
+INFERENCE
+  -> for each lowered layer:
+       * generate / stage A tile
+       * acquire DMA_OWNER=1
+       * DMA ACT_LOAD
+       * acquire DMA_OWNER=1
+       * DMA WEIGHT_LOAD
+       * release DMA_OWNER
+       * ACC START
+       * poll ACC_STATUS.BUSY/DONE
+       * acquire DMA_OWNER=1
+       * DMA RESULT_STORE to OUTPUT
+       * release DMA_OWNER
+       * accumulate / requantize / pool / ReLU as required
+  -> final FC logits
+  -> argmax
+  -> send RESULT frame
+ERROR
+  -> read SYS / ACC / DMA error
+  -> abort DMA if active
+  -> use accelerator local reset for accelerator FAULT
+  -> use SYS_SOFT_RESET only when software can safely issue it
+  -> external reset if CPU trap halts execution
+Implementation note: The accelerator is not a generic CNN runtime. Firmware owns layer scheduling, K-split 
+accumulation, buffer ownership, and preprocessing.
+14. RTL Module Handoff
+Module Required responsibility Must not do
+soc_top.sv Clock/reset entry, PicoRV32 instance, all 
+integration blocks No AXI/PS
+native_interconnect.sv Decode CPU native bus to 
+IMEM/DMEM/MMIO; bound request latency No accelerator protocol logic
+imem_bram.sv 32 KiB instruction storage No DMA writes
+dmem_bram_dp.sv 224 KiB data storage with CPU port + DMA 
+port No same-address dual-write behavior
+sys_regs.sv SYS_ID/status/control/cycle counter No accelerator datapath
+=== PAGE 13 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+acc_wrapper.sv Fixed-IP translation, ownership, state/error 
+logic No PE/systolic redesign
+dma_engine.sv CPU-programmed 64/256-byte transfers, 
+accelerator element sequencing No auto-START
+uart.sv 16-byte RX/TX FIFOs, 115200 transport No CNN protocol state machine
+reset_ctrl.sv Synchronous reset sequencing and 
+accelerator local reset pulse No asynchronous internal clocks
+14.1 Top-level ports
+module soc_top (
+    input  logic clk_100m,
+    input  logic ext_reset_n,
+    input  logic uart_rx,
+    output logic uart_tx
+);
+endmodule
+Implementation note: Do not add board-specific UART/reset pins beyond these logical ports until the final ZedBoard 
+XDC is selected.
+15. Verification Plan
+Stage Test Pass criterion
+V0 PicoRV32 repository compile Official `picorv32.v` compiles with frozen 
+parameters
+V1 CPU boot/DMEM Program executes and verifies memory 
+read/write
+V2 MMIO access rules Read wstrb=0000, write=1111, invalid accesses 
+terminate
+V3 Fixed accelerator regression Known/random signed matrices are bit-exact
+V4 Wrapper Ownership, START, DONE latch, ACC_READ, 
+errors behave as specified
+V5 DMA 64-byte loads / 256-byte store, packing and 
+ordering correct
+V6 SoC integration CPU configures DMA/ACC and retrieves correct 
+INT32 results
+V7 UART 115200 loopback and firmware framing work
+V8 Single-layer CNN Per-layer tensors match golden reference
+V9 Full CNN Final 10-class prediction matches golden 
+reference
+V10 FPGA timing WNS/TNS/WHS >= 0, zero unconstrained paths
+V11 Hardware demo At least 10 images classify correctly and results 
+are logged
+15.1 Required fixed-IP tests
+ Zero matrices.
+ Identity matrix where representable.
+ All +127 operands.
+ All -128 operands.
+ Mixed signs and alternating signs.
+ Random matrices with at least 100 independent seeds.
+ START while BUSY: must not restart or modify results.
+ Read each result address 0..63 after DONE and compare against the golden matrix.
+ Confirm DONE is exactly one pulse and nominal schedule is 154 controller cycles.
+=== PAGE 14 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+15.2 Required assertions
+A1: fixed-IP START is never asserted for more than one cycle.
+A2: START is accepted only when wrapper is IDLE, fixed IP not busy, DMA_OWNER=0.
+A3: CPU ACC_WRITE_DATA partial-strobe writes never change accelerator storage.
+A4: DMA reads use wstrb=0000; DMA memory writes use wstrb=1111.
+A5: DMA never starts accelerator automatically.
+A6: at most one DMA memory read is outstanding.
+A7: DMA_OWNER cannot change while DMA is busy.
+A8: no illegal access is stalled indefinitely.
+A9: fixed-IP DONE is latched only after an accepted START.
+A10: same-address CPU/DMA dual-write is never allowed.
+A11: accelerator result index order is 0..63 row-major during DMA drain.
+A12: timeout always reaches a bounded recovery state.
+16. Performance and Resource Reporting
+No unmeasured speedup claim is part of the architecture. The implementation report shall separate compute 
+from data movement.
+Metric How to measure
+T_acc accepted ACC START  fixed IP DONE→
+T_load_A DMA ACT_LOAD start  done→
+T_load_B DMA WEIGHT_LOAD start  done→
+T_drain DMA RESULT_STORE start  done→
+T_layer first tile start  final output read/accumulate→
+T_end_to_end input ready in INPUT  final result frame→
+CPU-only baseline same lowered workload using PicoRV32 software MACs only
+Resource Vivado LUT / FF / BRAM / DSP / I/O
+Timing post-route WNS / TNS / WHS at 100 MHz
+Implementation note: UART transfer time must be reported separately from inference time because 115200 baud is 
+intentionally a low-bandwidth debug/demo link.
+17. FPGA / Vivado Implementation
+ Target part: XC7Z020 device on Digilent ZedBoard.
+ One 100 MHz primary clock constraint.
+ No AXI IP is required for the MVP.
+ Use inferred/instantiated BRAM for instruction and data memories; synthesis is the source of truth for BRAM 
+count.
+ Provide a final XDC with clock constraint, UART I/O standards, and exact UART/reset pins only after board 
+pin selection.
+ The PL bitstream is loaded over JTAG during bring-up unless a separate configuration-memory workflow is 
+added later.
+ The UART electrical level must be 3.3 V compatible with the selected ZedBoard PL bank.
+18. Memory Image / Build Reproducibility
+ The implementation shall build IMEM and WEIGHTS from deterministic `.mem`/hex images.
+=== PAGE 15 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+ Document byte order: within each 32-bit word, byte 0 maps to bits [7:0], byte 1 to [15:8], byte 2 to [23:16], 
+byte 3 to [31:24].
+ Record the PicoRV32 repository commit hash, accelerator RTL hash, firmware commit/hash, model version, 
+Vivado version, and final XDC revision.
+ A simulation build must load the exact same firmware image and model/weight image used by the 
+corresponding hardware benchmark.
+19. Release Acceptance Criteria
+Gate Required result
+CPU PicoRV32 boots and passes memory/MMIO smoke test
+Accelerator Standalone fixed-IP regression passes
+Wrapper All ownership/error/START/DONE tests pass
+DMA All three legal modes pass; no auto-chain
+Memory No overlaps; model fits allocated regions
+UART Loopback + firmware frame test passes
+CNN Per-layer golden comparison passes
+Timing WNS/TNS/WHS >= 0 at 100 MHz; no unconstrained paths
+Hardware At least 10 representative images produce golden-matching 
+classes
+Implementation note: Performance results are measured and reported; no marketing-level GOPS or speedup number 
+may be claimed until supported by post-route FPGA measurements.
+20. Explicit Non-Goals
+ No AXI fabric.
+ No Zynq PS or PS DDR.
+ No Linux.
+ No generic CNN compiler/runtime.
+ No scatter-gather DMA.
+ No cache.
+ No camera/JPEG decoder.
+ No redesign of the supplied 8×8 accelerator.
+ No second accelerator.
+ No UVM requirement; plain SystemVerilog directed/scoreboard verification is sufficient for the MVP.
+21. Source Provenance
+Source Use in this specification
+YosysHQ PicoRV32 — https://github.com/YosysHQ/picorv32 CPU IP, native memory interface, parameter names
+User-supplied `rtl.zip` Fixed accelerator module names, ports, storage interface, 
+8×8/64-PE structure
+User-supplied `RISC-V_SoC_Corrected.pdf` Prior architecture baseline and review corrections
+The official PicoRV32 repository currently documents the native `picorv32` core as a simple valid/ready memory 
+interface and separately documents `picorv32_axi`. This v4.0 baseline intentionally selects the native core and 
+does not use AXI.
+=== PAGE 16 ===
+RISC-V SoC + 8×8 WS Accelerator — Implementation Specification v4.0
+Code-generation baseline • PL-only • PicoRV32 native bus • ZedBoard XC7Z020
+22. Final Code-Generation Checklist
+[ ] Use `picorv32` native core, not AXI variant.
+[ ] Set ENABLE_FAST_MUL=1 and ENABLE_DIV=1.
+[ ] Keep PROGADDR_RESET=0x00000000 and STACKADDR=0x0000FFF0.
+[ ] Implement one native interconnect with the single authoritative address map.
+[ ] Implement 32 KiB IMEM and 224 KiB DMEM with a CPU port and a DMA port.
+[ ] Instantiate the user accelerator unchanged.
+[ ] Implement accelerator wrapper ownership and CPU/MMIO element access.
+[ ] Implement CPU-programmed DMA with ACT_LOAD, WEIGHT_LOAD, RESULT_STORE.
+[ ] No DMA auto-start of accelerator.
+[ ] Implement PL UART at 115200 with 16-byte FIFOs.
+[ ] Provide deterministic memory initialization and linker placement.
+[ ] Create standalone accelerator regression before system regression.
+[ ] Create CPU boot, MMIO, DMA, wrapper, UART, and end-to-end tests.
+[ ] Do not report performance as proven until post-route measurement exists.
+23. Specification Status
+STATUS: IMPLEMENTATION BASELINE — READY FOR HAND-OFF TO A CODE-GENERATION AGENT. Fixed-
+IP correctness remains a mandatory standalone regression gate.

@@ -1,0 +1,74 @@
+[
+  {
+    "id": 0,
+    "name": "zero_vector",
+    "expected_class": 0,
+    "size_bytes": 784
+  },
+  {
+    "id": 1,
+    "name": "cross_pattern",
+    "expected_class": 0,
+    "size_bytes": 784
+  },
+  {
+    "id": 2,
+    "name": "horizontal_stripes",
+    "expected_class": 0,
+    "size_bytes": 784
+  },
+  {
+    "id": 3,
+    "name": "vertical_bars",
+    "expected_class": 0,
+    "size_bytes": 784
+  },
+  {
+    "id": 4,
+    "name": "ring_pattern",
+    "expected_class": 9,
+    "size_bytes": 784
+  },
+  {
+    "id": 5,
+    "name": "diagonal_gradient",
+    "expected_class": 4,
+    "size_bytes": 784
+  },
+  {
+    "id": 6,
+    "name": "extreme_checkerboard",
+    "expected_class": 0,
+    "size_bytes": 784
+  },
+  {
+    "id": 7,
+    "name": "center_dot",
+    "expected_class": 0,
+    "size_bytes": 784
+  },
+  {
+    "id": 8,
+    "name": "four_corners",
+    "expected_class": 0,
+    "size_bytes": 784
+  },
+  {
+    "id": 9,
+    "name": "noisy_digit_9",
+    "expected_class": 4,
+    "size_bytes": 784
+  },
+  {
+    "id": 10,
+    "name": "t_shape",
+    "expected_class": 0,
+    "size_bytes": 784
+  },
+  {
+    "id": 11,
+    "name": "l_shape",
+    "expected_class": 0,
+    "size_bytes": 784
+  }
+]
